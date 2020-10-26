@@ -1,0 +1,14 @@
+.DS_Store
+*.swp
+*.pyc
+/dist/
+/src/
+/libchromiumcontent.tar.bz2
+/libchromiumcontent-static.tar.bz2
+.gclient
+/.cipd
+/log
+.gclient_entries
+_gclient_src_*
+s3credentials
+/native-mksnapshot.tar.bz2

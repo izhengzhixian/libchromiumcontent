@@ -1,0 +1,367 @@
+#!/usr/bin/env python
+
+import argparse
+import contextlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib2
+import platform
+import tarfile
+
+import lib.filesystem as filesystem
+import lib.sccache as sccache
+import lib.util as util
+
+from lib.config import MIPS64EL_GCC, MIPS64EL_GCC_URL, MIPS64EL_SYSROOT, \
+                       set_mips64el_env, IS_ARM64_HOST, IS_ARMV7_HOST, \
+                       SOURCE_ROOT, VENDOR_DIR, DEPOT_TOOLS_DIR, SRC_DIR, \
+                       PLATFORM_KEY
+
+CHROMIUMCONTENT_SOURCE_DIR = os.path.join(SOURCE_ROOT, 'chromiumcontent')
+CHROMIUMCONTENT_DESTINATION_DIR = os.path.join(
+    SRC_DIR, 'libchromiumcontent', 'chromiumcontent')
+CHROMIUMCONTENT_SRC_URL = 'https://s3.amazonaws.com/github-janky-artifacts/libchromiumcontent'
+
+DEBIAN_MIRROR = 'http://ftp.jp.debian.org/debian/pool/main/'
+BINTOOLS_NAME = 'c/cross-binutils/binutils-aarch64-linux-gnu_2.25-5_amd64.deb'
+GCLIENT_CONFIG_PATH = os.path.join(SOURCE_ROOT, '.gclient')
+GCLIENT_CONFIG_TEMPLATE = '''
+solutions = [
+  {{
+    "url": "https://chromium.googlesource.com/chromium/src.git",
+    "managed": False,
+    "name": "src",
+    "deps_file": ".DEPS.git",
+    "custom_vars": {{
+      "checkout_nacl": False
+    }},
+    "custom_deps": {{}},
+  }},
+]
+{cache_dir_line}
+'''
+SRC_FILES_TO_IGNORE = [
+  os.path.join('src', 'native_client'),
+  os.path.join('src', 'third_party', 'WebKit', 'LayoutTests'),
+  os.path.join('src', 'third_party', 'catapult', 'tracing', 'test_data'),
+  os.path.join('src', 'third_party', 'deqp'),
+  os.path.join('src', 'third_party', 'sqlite', 'sqlite-src-3200100', 'test'),
+  os.path.join('src', 'third_party', 'sqlite', 'src', 'test'),
+  os.path.join('src', 'tools', 'swarming_client', 'example')
+]
+
+def main():
+  args = parse_args()
+
+  if sys.platform == 'win32' and args.update_depot_tools:
+    update_depot_tools()
+
+  if args.clean and os.path.isdir(SRC_DIR):
+    git_clean_recursive(SRC_DIR)
+
+  # Warning about using a network share as git cache from Windows 7+: The
+  # gclient script may experience errors unless you disable SMBv2 cache by
+  # setting the registry key
+  # HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Lanmanworkstation\Parameters\DirectoryCacheLifetime
+  # to 0.
+  # More information: https://stackoverflow.com/a/9935126
+  git_cache = args.git_cache or os.getenv('LIBCHROMIUMCONTENT_GIT_CACHE', '')
+
+  target_arch = args.target_arch
+  nohooks = target_arch == 'arm64' and IS_ARM64_HOST or target_arch == 'arm' and IS_ARMV7_HOST
+
+
+  if args.run_gclient:
+    if args.use_packaged_src:
+      get_packaged_src(args.clean, git_cache, nohooks, args.upload_packaged_src)
+    else:
+      gclient_sync(chromium_version(), args.clean, git_cache, nohooks)
+    if args.source_only:
+      return
+
+  if sys.platform in ['win32', 'cygwin']:
+    update_toolchain_json()
+
+  if target_arch == 'arm64':
+    install_aarch64_bintools()
+
+  return ((apply_patches(target_arch) if args.apply_patches else 0) or
+          install_sysroot_if_needed(target_arch) or
+          copy_chromiumcontent_files() or
+          update_clang() or
+          setup_mips64el_toolchain(target_arch) or
+          run_gn(target_arch, args.cc_wrapper))
+
+
+def parse_args():
+  parser = argparse.ArgumentParser(description='Update build configuration')
+  parser.add_argument('-t', '--target_arch', default='x64', help='x64 or ia32')
+  parser.add_argument('--git-cache', default='',
+                      help='Global git object cache for Chromium+ deps')
+  parser.add_argument('--clean', action='store_true',
+                      help='Cleans the working directory for full rebuild')
+  parser.add_argument('--skip_patches', dest='apply_patches', action='store_false',
+                      help='Skips applying patches, easier to build locally')
+  parser.add_argument('--skip_gclient', dest='run_gclient', action='store_false',
+                      help='Skips syncing repo, easier to build locally')
+  parser.add_argument('--skip_depot_tools_update', dest='update_depot_tools', action='store_false',
+                      help='Skips update depot tools on Windows, easier to build locally')
+  parser.add_argument('--source_only', action='store_true',
+                      help='Only sync the Chromium source code')
+  parser.add_argument('--use_packaged_src', action='store_true',
+                      help='Get chromium source as packaged file')
+  parser.add_argument('--upload_packaged_src', action='store_true',
+                      help='Upload packaged chromium source if it does not exist')
+
+  cc_wrapper_group = parser.add_mutually_exclusive_group()
+  cc_wrapper_group.add_argument('--cc_wrapper',
+                                help="Compiler cache to use. E.g. ccache, sccache, etc.")
+  cc_wrapper_group.add_argument('--ccache',
+                                action='store_const', const='ccache', dest='cc_wrapper',
+                                help="Use ccache as a compiler cache.")
+  cc_wrapper_group.add_argument('--sccache',
+                                action='store_const', const='sccache', dest='cc_wrapper',
+                                help="Use sccache as a compiler cache.")
+  cc_wrapper_group.add_argument('--use-bundled-sccache',
+                                action='store_const', const=sccache.get_binary_path(), dest='cc_wrapper',
+                                help='Use sccache binary stored in with the libcc repo.')
+
+  parser.set_defaults(apply_patches=True, run_gclient=True, update_depot_tools=True)
+  return parser.parse_args()
+
+
+def chromium_version():
+  with open(os.path.join(SOURCE_ROOT, 'VERSION')) as f:
+    return f.readline().strip()
+
+
+def install_sysroot_if_needed(target_arch):
+  if sys.platform != 'linux2':
+    return 0
+
+  if target_arch == 'ia32':
+    target_cpu = 'i386'
+  elif target_arch == 'x64':
+    target_cpu = 'amd64'
+  else:
+    target_cpu = target_arch
+
+  for arch in ('arm', 'arm64', 'amd64', 'i386'):
+    # Download from chromium's sysroot storage.
+    install = os.path.join(SRC_DIR, 'build', 'linux', 'sysroot_scripts',
+                           'install-sysroot.py')
+    subprocess.check_call([sys.executable, install, '--arch', arch])
+
+  if target_cpu == 'mips64el':
+    # Download from our own sysroot storage.
+    destination = os.path.join(SRC_DIR, 'build', 'linux')
+    if os.path.exists(os.path.join(destination, 'debian_jessie_mips64-sysroot')):
+      return
+
+    tar_name = 'debian_jessie_mips64-sysroot.tar.bz2'
+    download(MIPS64EL_SYSROOT, tar_name)
+    subprocess.call(['tar', '-jxf', tar_name, '-C', destination])
+    filesystem.rm_f(tar_name)
+
+  return 0
+
+
+def install_aarch64_bintools():
+  destination = os.path.join(VENDOR_DIR, 'binutils-aarch64')
+  if os.path.exists(destination):
+    return
+
+  deb_name = 'binutils-aarch64.deb'
+  download(DEBIAN_MIRROR + BINTOOLS_NAME, deb_name)
+
+  env = os.environ.copy()
+  env['DEPOT_TOOLS_WIN_TOOLCHAIN'] = '0'
+  subprocess.call(['dpkg', '-x', deb_name, destination])
+  filesystem.rm_f(deb_name)
+
+
+def update_toolchain_json():
+  env = os.environ.copy()
+  env['DEPOT_TOOLS_WIN_TOOLCHAIN'] = '0'
+  vs_toolchain = os.path.join(SRC_DIR, 'build', 'vs_toolchain.py')
+  subprocess.check_call([sys.executable, vs_toolchain, 'update'], env=env)
+
+
+def copy_chromiumcontent_files():
+  filesystem.mkdir_p(CHROMIUMCONTENT_DESTINATION_DIR)
+  for dirpath, dirnames, filenames in os.walk(CHROMIUMCONTENT_SOURCE_DIR):
+    for dirname in dirnames:
+      source = os.path.join(dirpath, dirname)
+      relative = os.path.relpath(source, start=CHROMIUMCONTENT_SOURCE_DIR)
+      filesystem.mkdir_p(os.path.join(CHROMIUMCONTENT_DESTINATION_DIR, relative))
+    for filename in filenames:
+      source = os.path.join(dirpath, filename)
+      relative = os.path.relpath(source, start=CHROMIUMCONTENT_SOURCE_DIR)
+      destination = os.path.join(CHROMIUMCONTENT_DESTINATION_DIR, relative)
+      if is_newer(destination, source):
+        continue
+      shutil.copy2(source, destination)
+
+
+def update_depot_tools():
+  env = os.environ.copy()
+  # Don't actually update the depot tools, just install the required
+  # tools like python
+  env['DEPOT_TOOLS_UPDATE'] = '0'
+  # Remove trailing slash from TEMP
+  # https://bugs.chromium.org/p/chromium/issues/detail?id=340243
+  env['TEMP'] = env['TEMP'].rstrip('\\')
+  env['PATH'] = os.pathsep.join([DEPOT_TOOLS_DIR, env['PATH']])
+  update_path = os.path.join(DEPOT_TOOLS_DIR, 'update_depot_tools.bat')
+  subprocess.check_call([update_path], env=env)
+
+
+def ensure_gclient_config(git_cache):
+  # escape backslashes to avoid escaping the cache_dir assignment quote
+  git_cache = git_cache.replace('\\', '\\\\')
+  with open(GCLIENT_CONFIG_PATH, 'wb') as f:
+    f.write(GCLIENT_CONFIG_TEMPLATE.format(
+      cache_dir_line="cache_dir = '{0}'".format(git_cache) if git_cache else ''
+      ))
+
+
+def gclient_sync(version, force, git_cache, nohooks):
+  # Remove untracked files in src.
+  if os.path.exists(os.path.join(SRC_DIR, '.git')):
+    with util.scoped_cwd(SRC_DIR):
+      subprocess.check_call(['git', 'clean', '-df'])
+
+  ensure_gclient_config(git_cache)
+  env = os.environ.copy()
+  if sys.platform in ['win32', 'cygwin']:
+    env['DEPOT_TOOLS_WIN_TOOLCHAIN'] = '0'
+  env['PATH'] = os.pathsep.join([DEPOT_TOOLS_DIR, env['PATH']])
+  gclient = os.path.join(DEPOT_TOOLS_DIR, 'gclient.py')
+  args = [sys.executable, gclient, 'sync', '--jobs', '16',
+          '--revision', 'src@{0}'.format(version), '--with_tags',
+          '--with_branch_heads', '--reset', '--delete_unversioned_trees']
+  if git_cache:
+    args += ['--lock_timeout=15']
+  if force:
+    args += ['--force']
+  if nohooks:
+    args += ['--nohooks']
+  subprocess.check_call(args, env=env)
+
+
+def apply_patches(target_arch):
+  script_path = os.path.join(SOURCE_ROOT, 'script', 'apply-patches')
+  script_arguments = ['--target_arch', target_arch]
+  return subprocess.call([sys.executable, script_path] + script_arguments)
+
+
+def update_clang():
+  env = os.environ.copy()
+  env['PATH'] = os.pathsep.join([DEPOT_TOOLS_DIR, env['PATH']])
+  env['DEPOT_TOOLS_WIN_TOOLCHAIN'] = '0'
+  update = os.path.join(SRC_DIR, 'tools', 'clang', 'scripts', 'update.py')
+  return subprocess.call([sys.executable, update], env=env)
+
+
+def setup_mips64el_toolchain(target_arch):
+  if target_arch != 'mips64el':
+    return
+
+  # Download mips64el toolchains.
+  if not os.path.exists(os.path.join(VENDOR_DIR, MIPS64EL_GCC)):
+    tar_name = MIPS64EL_GCC + '.tar.gz'
+    download(MIPS64EL_GCC_URL, tar_name)
+    subprocess.check_call(['tar', '-xf', tar_name, '-C', VENDOR_DIR])
+    filesystem.rm_f(tar_name)
+
+  # Gernerate ffmpeg build config files for mips64el.
+  env = os.environ.copy()
+  set_mips64el_env(env)
+  ffmpeg_dir = os.path.join(SRC_DIR, 'third_party', 'ffmpeg')
+  subprocess.check_call(['chromium/scripts/build_ffmpeg.py', 'linux', 'mips64el'], cwd=ffmpeg_dir, env=env)
+  subprocess.check_call(['chromium/scripts/copy_config.sh'], cwd=ffmpeg_dir)
+  subprocess.check_call(['chromium/scripts/generate_gn.py'], cwd=ffmpeg_dir)
+
+
+def run_gn(target_arch, cc_wrapper=None):
+  gn_args = {}
+
+  if cc_wrapper is not None:
+    gn_args['cc_wrapper'] = cc_wrapper
+
+  script_path = os.path.join(SOURCE_ROOT, 'script', 'run-gn')
+  script_arguments = [
+      '--args', json.dumps(gn_args),
+      '--target_arch', target_arch
+      ]
+  return subprocess.call([sys.executable, script_path] + script_arguments)
+
+
+def is_newer(destination, source):
+  return os.path.exists(destination) and \
+    os.path.getmtime(destination) > os.path.getmtime(source)
+
+
+def git_clean_recursive(path):
+  for root, dirs, files in os.walk(path):
+    if '.git' in dirs:
+      subprocess.call(['git', 'clean', '-xdf'], cwd=root)
+      dirs.remove('.git')
+
+
+def download(url, filename):
+  with open(filename, 'wb+') as f:
+    with contextlib.closing(urllib2.urlopen(url)) as u:
+      while True:
+        chunk = u.read(1024*1024)
+        if not len(chunk):
+          break
+        f.write(chunk)
+
+def get_packaged_src(clean, git_cache, nohooks, upload_src):
+  src_version = chromium_version()
+  tar_name = 'src.tar.bz2'
+  package_url = '{0}/{1}/src/{2}/{3}'.format(CHROMIUMCONTENT_SRC_URL,
+                                         PLATFORM_KEY, src_version, tar_name)
+  try:
+    print('Trying to download ' + package_url)
+    filesystem.download_and_extract(SOURCE_ROOT, package_url)
+    os.environ['CHROMIUM_BUILDTOOLS_PATH'] = os.path.join(SRC_DIR, 'buildtools')
+  except urllib2.URLError as err:
+    print('Could not download {0}, syncing from git'.format(package_url))
+    gclient_sync(src_version, clean, git_cache, nohooks)
+    if upload_src:
+      try:
+        print('Packaging source to ' + tar_name + '.')
+        tar_path =  os.path.join(SOURCE_ROOT, tar_name)
+        filesystem.safe_unlink(tar_path)
+        with util.scoped_cwd(SOURCE_ROOT):
+          tar_file = tarfile.open(tar_path, 'w:bz2')
+          tar_file.add('src', exclude=exclude_packaged_files)
+          tar_file.close()
+        if ('LIBCHROMIUMCONTENT_S3_ACCESS_KEY' in os.environ and
+          'LIBCHROMIUMCONTENT_S3_BUCKET' in os.environ and
+          'LIBCHROMIUMCONTENT_S3_SECRET_KEY' in os.environ):
+          script_path = os.path.join(SOURCE_ROOT, 'script', 'upload')
+          script_arguments = ['--upload_packaged_src', '--chromium_version', src_version]
+          print('Uploading source to ' + package_url + '.')
+          subprocess.check_call([sys.executable, script_path] + script_arguments)
+      except OSError as e:
+        print('Unexpected error packaging {0} in chromium source: {1}'.format(e.strerror, e.filename))
+  except:
+    print('Unexpected error downloading and extracting chromium source:', sys.exc_info()[0])
+    raise
+
+
+def exclude_packaged_files(filename):
+  if ".git" in filename:
+    return True
+  else:
+    return filename in SRC_FILES_TO_IGNORE
+
+if __name__ == '__main__':
+  import sys
+  sys.exit(main())

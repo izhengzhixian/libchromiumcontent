@@ -1,0 +1,770 @@
+#!/usr/bin/env python
+
+import argparse
+import fnmatch
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import platform
+
+import lib.filesystem as filesystem
+import lib.util as util
+
+from lib.config import MIPS64EL_GCC, set_mips64el_env, get_output_dir, \
+                       SOURCE_ROOT, VENDOR_DIR, SRC_DIR, DEPOT_TOOLS_DIR, \
+                       TOOLS_DIR
+from lib.ninja import run as run_ninja
+
+from lib import ninja_syntax
+
+DIST_DIR = os.path.join(SOURCE_ROOT, 'dist')
+
+# import helper module to generate ninja build files
+
+# Almost everything goes into the main archive
+MAIN_DIR = os.path.join(DIST_DIR, 'main')
+DIST_SRC_DIR = os.path.join(MAIN_DIR, 'src')
+
+COPY_PY = os.path.join(TOOLS_DIR, 'copy.py')
+LICENSES_PY = os.path.join(TOOLS_DIR, 'licenses.py')
+
+TARGET_PLATFORM = {
+  'cygwin': 'win32',
+  'darwin': 'darwin',
+  'linux2': 'linux',
+  'win32': 'win32',
+}[sys.platform]
+
+SHARED_LIBRARY_SUFFIX = {
+  'darwin': 'dylib',
+  'linux': 'so',
+  'win32': 'dll',
+}[TARGET_PLATFORM]
+STATIC_LIBRARY_SUFFIX = {
+  'darwin': 'a',
+  'linux': 'a',
+  'win32': 'lib',
+}[TARGET_PLATFORM]
+
+COMPONENTS = ['static_library', 'shared_library']
+BINARIES = {
+  'all': [
+    'icudtl.dat',
+    'v8_context_snapshot.bin',
+    os.path.join('gen', 'third_party', 'blink', 'public', 'resources', 'blink_image_resources_200_percent.pak'),
+    os.path.join('gen', 'content', 'app', 'resources', 'content_resources_200_percent.pak'),
+    os.path.join('gen', 'ui', 'resources', 'ui_resources_200_percent.pak'),
+    os.path.join('gen', 'ui', 'resources', 'ui_resources_300_percent.pak'),
+    os.path.join('gen', 'ui', 'views', 'resources', 'views_resources_200_percent.pak'),
+    os.path.join('gen', 'ui', 'views', 'resources', 'views_resources_300_percent.pak'),
+  ],
+  'darwin': [
+    'libffmpeg.dylib',
+  ],
+  'linux': [
+    'libffmpeg.so',
+  ],
+  'win32': [
+    'd3dcompiler_47.dll',
+    'ffmpeg.dll',
+    'ffmpeg.dll.lib',
+    'libEGL.dll',
+    'libGLESv2.dll',
+    os.path.join('gen', 'ui', 'resources', 'ui_unscaled_resources.rc'),
+  ],
+}
+
+V8_SNAPSHOT_BINARIES = {
+  'darwin': [
+    'snapshot_blob.bin',
+    'v8_context_snapshot_generator',
+  ],
+  'linux': [
+    'snapshot_blob.bin',
+    'v8_context_snapshot_generator',
+  ],
+  'win32': [
+    'snapshot_blob.bin',
+    'v8_context_snapshot_generator.exe',
+  ],
+}
+
+BINARIES_SHARED_LIBRARY = {
+  'darwin': [
+    os.path.join('obj', 'base', 'libbase_static.a'),
+    os.path.join('obj', 'components', 'cdm', 'renderer', 'librenderer.a'),
+    os.path.join('obj', 'net', 'libhttp_server.a'),
+    os.path.join('obj', 'third_party', 'webrtc', 'rtc_base', 'librtc_base.a'),
+    os.path.join('obj', 'third_party', 'webrtc', 'rtc_base', 'librtc_base_generic.a'),
+    os.path.join('obj', 'third_party', 'webrtc_overrides', 'libinit_webrtc.a'),
+    os.path.join('obj', 'ui', 'events', 'libdom_keycode_converter.a'),
+    os.path.join('obj', 'pdf', 'libpdf.a'),
+    os.path.join('obj', 'services', 'device', 'wake_lock', 'power_save_blocker', 'libpower_save_blocker.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libpdfium.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libfdrm.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libformfiller.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libfpdfapi.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libfpdfdoc.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libfpdftext.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libfxcodec.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libfxcrt.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libfxge.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libfxjs.a'),
+    os.path.join('obj', 'third_party', 'pdfium', 'libpwl.a'),
+  ],
+  'linux': [
+    os.path.join('obj', 'base', 'libbase_static.a'),
+    os.path.join('obj', 'components', 'cdm', 'renderer', 'librenderer.a'),
+    os.path.join('obj', 'ui', 'events', 'libdom_keycode_converter.a'),
+    os.path.join('obj', 'pdf', 'libpdf.a'),
+  ],
+  'win32': [
+    os.path.join('obj', 'base', 'base_static_cc.pdb'),
+    os.path.join('obj', 'base', 'base_static.lib'),
+    os.path.join('obj', 'base', 'win', 'pe_image_cc.pdb'),
+    os.path.join('obj', 'base', 'win', 'pe_image.lib'),
+    os.path.join('obj', 'components', 'cdm', 'renderer', 'renderer_cc.pdb'),
+    os.path.join('obj', 'components', 'cdm', 'renderer', 'renderer.lib'),
+    os.path.join('obj', 'net', 'extras_cc.pdb'),
+    os.path.join('obj', 'net', 'extras.lib'),
+    os.path.join('obj', 'net', 'http_server_cc.pdb'),
+    os.path.join('obj', 'net', 'http_server.lib'),
+    os.path.join('obj', 'pdf', 'pdf_cc.pdb'),
+    os.path.join('obj', 'pdf', 'pdf.lib'),
+    os.path.join('obj', 'sandbox', 'win', 'sandbox_cc.pdb'),
+    os.path.join('obj', 'sandbox', 'win', 'sandbox.lib'),
+    os.path.join('obj', 'services', 'device', 'wake_lock', 'power_save_blocker', 'power_save_blocker_cc.pdb'),
+    os.path.join('obj', 'services', 'device', 'wake_lock', 'power_save_blocker', 'power_save_blocker.lib'),
+    os.path.join('obj', 'third_party', 'freetype', 'freetype_source_c.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'pdfium_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'pdfium.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fdrm_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fdrm.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'formfiller_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'formfiller.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fpdfapi_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fpdfapi.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fpdfdoc_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fpdfdoc.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fpdftext_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fpdftext.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fxcodec_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fxcodec.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fxcrt_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fxcrt.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fxge_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fxge.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fxjs_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'fxjs.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'pwl_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'pwl.lib'),
+    os.path.join('obj', 'third_party', 'pdfium', 'third_party', 'bigint_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'third_party', 'fx_agg_cc.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'third_party', 'fx_lcms2_c.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'third_party', 'fx_libopenjpeg_c.pdb'),
+    os.path.join('obj', 'third_party', 'pdfium', 'third_party', 'pdfium_base_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc', 'modules', 'desktop_capture', 'desktop_capture_generic.lib'),
+    os.path.join('obj', 'third_party', 'webrtc', 'modules', 'desktop_capture', 'primitives.lib'),
+    os.path.join('obj', 'third_party', 'webrtc', 'rtc_base', 'rtc_base_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc', 'rtc_base', 'rtc_base.lib'),
+    os.path.join('obj', 'third_party', 'webrtc', 'rtc_base', 'rtc_base_approved_generic_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc', 'rtc_base', 'rtc_base_generic_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc', 'rtc_base', 'rtc_base_generic.lib'),
+    os.path.join('obj', 'third_party', 'webrtc_overrides', 'init_webrtc_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc_overrides', 'init_webrtc.lib'),
+    os.path.join('obj', 'third_party', 'zlib', 'zlib_c.pdb'),
+    os.path.join('obj', 'third_party', 'zlib', 'zlib_adler32_simd_c.pdb'),
+    os.path.join('obj', 'third_party', 'zlib', 'zlib_x86_simd_c.pdb'),
+    os.path.join('obj', 'ui', 'events', 'dom_keycode_converter_cc.pdb'),
+    os.path.join('obj', 'ui', 'events', 'dom_keycode_converter.lib'),
+    # PDB files for libraries that generated under obj/chromiumcontent:
+    os.path.join('obj', 'components', 'security_state', 'core', 'core_cc.pdb'),
+    os.path.join('obj', 'components', 'security_state', 'content', 'content_cc.pdb'),
+    os.path.join('obj', 'content', 'sandbox_helper_win_cc.pdb'),
+    os.path.join('obj', 'ppapi', 'cpp', 'objects_cc.pdb'),
+    os.path.join('obj', 'ppapi', 'cpp', 'private', 'internal_module_cc.pdb'),
+    os.path.join('obj', 'third_party', 'libjpeg_turbo', 'libjpeg_c.pdb'),
+    os.path.join('obj', 'third_party', 'libjpeg_turbo', 'simd_c.pdb'),
+    os.path.join('obj', 'third_party', 'libyuv', 'libyuv_internal_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc', 'modules', 'desktop_capture', 'desktop_capture_generic_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc', 'modules', 'desktop_capture', 'desktop_capture_differ_sse2_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc', 'modules', 'desktop_capture', 'primitives_cc.pdb'),
+    os.path.join('obj', 'third_party', 'webrtc', 'system_wrappers', 'system_wrappers_cc.pdb'),
+  ],
+}
+
+ARCH_BLACKLIST = {
+  'arm': [
+    'libdesktop_capture_differ_sse2.a',
+  ],
+  'arm64': [
+    'libdesktop_capture_differ_sse2.a',
+  ],
+  'x64': [
+    'libprotobuf_full_do_not_use.a',
+    'libprotoc_lib.a',
+    'libyuv_internal_cc.pdb',
+  ],
+  'ia32': [
+  ],
+  'mips64el': [
+  ],
+}
+
+SYMBOLS = {
+  'darwin': [
+    # OS X has a more complicated symbol creation process. See
+    # create_dsym() and copy_symbols().
+  ],
+  'linux': [
+    'libosmesa.so.dbg',
+  ],
+  'win32': [
+    'libGLESv2.dll.pdb',
+  ],
+}
+
+# Emperically determined to be required by client apps.
+INCLUDE_DIRS = [
+  'base',
+  'build',
+  'build/config/linux/pangocairo',
+  'cc',
+  'chrome/browser/net',
+  'chrome/browser/ui/libgtkui',
+  'chrome/common',
+  'components/cdm',
+  'components/component_updater',
+  'components/cookie_config',
+  'components/display_compositor',
+  'components/download/public',
+  'components/net_log',
+  'components/network_session_configurator/common',
+  'components/os_crypt',
+  'components/prefs',
+  'components/proxy_config',
+  'components/security_state',
+  'components/ukm',
+  'components/update_client',
+  'components/viz',
+  'content/browser',
+  'content/common',
+  'content/public',
+  'content/renderer',
+  'crypto',
+  'device',
+  'ipc',
+  'gin',
+  'gpu',
+  'media',
+  'mojo',
+  'net',
+  'pdf',
+  'printing',
+  'ppapi',
+  'sandbox',
+  'services',
+  'skia',
+  'storage',
+  'testing',
+  'third_party/boringssl',
+  'third_party/googletest',
+  'third_party/khronos',
+  'third_party/leveldatabase',
+  'third_party/protobuf/src/google/protobuf',
+  'third_party/WebKit/common',
+  'third_party/WebKit/Source/platform',
+  'third_party/WebKit/Source/wtf',
+  'third_party/WebKit/public',
+  'third_party/libyuv/include',
+  'third_party/webrtc',
+  'third_party/icu/source',
+  'third_party/mojo/src/mojo/public',
+  'third_party/skia',
+  'third_party/widevine',
+  'third_party/wtl/include',
+  'ui',
+  'url',
+  'v8/include',
+  'webkit',
+] + {
+  'darwin': [],
+  'linux': [
+    'dbus',
+    'third_party/speech-dispatcher',
+  ],
+  'win32': [],
+}[TARGET_PLATFORM]
+GENERATED_INCLUDE_DIRS = [
+  'base',
+  'build',
+  'cc',
+  'chrome/common',
+  'components/download/public',
+  'components/filesystem',
+  'components/leveldb',
+  'components/payments',
+  'components/ukm',
+  'content',
+  'device',
+  'gpu',
+  'ipc',
+  'mojo',
+  'media',
+  'net',
+  'ppapi',
+  'printing',
+  'third_party/WebKit',
+  'ui',
+  'url',
+  'sandbox/mac',
+  'services',
+  'skia',
+  'storage',
+]
+OTHER_HEADERS = [
+  'content/common/content_export.h',
+  'ui/events/keycodes/dom/dom_key_data.inc',
+  'ui/events/keycodes/dom/dom_code_data.inc',
+]
+OTHER_SOURCES = [
+]
+OTHER_DIRS = [
+  'ui/resources/cursors',
+  'buildtools/third_party/libc++/trunk/include',
+  'buildtools/third_party/libc++abi/trunk/include',
+]
+
+
+class Ninja(ninja_syntax.Writer):
+  def __init__(self, output):
+    # used to avoid duplicate copy builds
+    self._copies = set()
+    super(Ninja, self).__init__(output=output)
+
+  def __enter__(self):
+    self.variable('python', sys.executable)
+    self.variable('copy_py', COPY_PY)
+    self.variable('licenses_py', LICENSES_PY)
+    self.rule('copy', (
+      '${python} ${copy_py} ${in} ${out}' if TARGET_PLATFORM == 'win32' else 'cp -p ${in} ${out}'
+      ), description='COPY ${in}')
+    self.rule('license', (
+      '${python} ${licenses_py} credits ${out} --file-template '
+      '${file_template} --entry-template ${entry_template}'
+    ), description='LICENSE')
+    return self
+
+  def __exit__(self, t, v, tb):
+    self.output.close()
+
+  def copy(self, src, dest, dest_is_dir=True):
+    dest = os.path.normpath(dest)
+    if dest_is_dir:
+      dest = os.path.join(dest, os.path.basename(src))
+    if (src, dest,) not in self._copies:
+      self.build(dest, 'copy', src)
+      self._copies.add((src, dest,))
+
+
+def main():
+  args = parse_args()
+  target_arch = args.target_arch
+
+  if args.create_debug_archive:
+    check_create_debug_archive(args.target_arch)
+
+  filesystem.rm_rf(DIST_DIR)
+  os.makedirs(MAIN_DIR)
+
+  with Ninja(open(os.path.join(MAIN_DIR, 'build.ninja'), 'wb')) as ninja:
+    generate_ninja(args, ninja)
+
+  run_ninja(MAIN_DIR)
+
+  for component in COMPONENTS:
+    if ((args.component == 'all' or args.component == component)
+        and args.component != 'native_mksnapshot'):
+      strip_binaries(args.create_debug_archive, args.keep_debug_symbols,
+                     component, os.path.join(MAIN_DIR, component),
+                     args.target_arch)
+
+  if not args.no_zip:
+    create_archive(args.create_debug_archive, args.component)
+
+
+def generate_ninja(args, ninja):
+  target_arch = args.target_arch
+  create_debug_archive = args.create_debug_archive
+
+  # Some libraries are not available for certain arch.
+  for lib in ARCH_BLACKLIST[target_arch]:
+    if lib in BINARIES[TARGET_PLATFORM]:
+      BINARIES[TARGET_PLATFORM].remove(lib)
+
+  for component in COMPONENTS:
+    if ((args.component == 'all' or args.component == component) and
+        (component != 'native_mksnapshot' or 'arm' in target_arch)):
+      copy_binaries(target_arch, component, create_debug_archive,
+                    args.keep_debug_symbols, ninja)
+      copy_generated_sources(target_arch, component, ninja)
+      copy_locales(target_arch, component, ninja)
+
+  if args.component != 'native_mksnapshot':
+    copy_ffmpeg(target_arch, ninja)
+    copy_sources(ninja)
+  generate_licenses(ninja)
+
+
+def parse_args():
+  parser = argparse.ArgumentParser(description='Create distribution')
+  parser.add_argument('-t', '--target_arch', default='x64', help='x64 or ia32')
+  group = parser.add_mutually_exclusive_group()
+  group.add_argument('--create-debug-archive',
+                      default=False,
+                      required=False,
+                      action='store_true',
+                      help='Create archive with debug symbols and source code '
+                           'for the shared library build')
+  group.add_argument('--keep-debug-symbols',
+                      default=False,
+                      required=False,
+                      action='store_true',
+                      help='Keep debug symbols in shared library build')
+  parser.add_argument('-c', '--component', default='all',
+                      help='static_library or shared_library or all')
+  parser.add_argument('--no_zip', action='store_true',
+                      help='Do not create distribution archive')
+  return parser.parse_args()
+
+
+def program_available(prog):
+  try:
+    subprocess.check_output([prog, '--help'])
+    return True
+  except OSError as e:
+    return False
+
+
+def check_create_debug_archive(target_arch):
+  if TARGET_PLATFORM == 'win32':
+    return
+  errmsg = '--create-debug-archive option requires missing program {0}'
+  for prog in ['gdb', 'objcopy']:
+    if target_arch == 'arm':
+      prog = 'arm-linux-gnueabihf-' + prog
+    elif target_arch == 'arm64':
+      prog = 'aarch64-linux-gnu-' + prog
+    if not program_available(prog):
+      print errmsg.format(prog)
+      sys.exit(1)
+
+
+def copy_with_blacklist(target_arch, src, dest, ninja):
+  if os.path.basename(src) in ARCH_BLACKLIST[target_arch]:
+    return
+  ninja.copy(src, dest)
+
+
+def copy_binaries(target_arch, component, create_debug_archive,
+                  keep_debug_symbols, ninja):
+  output_dir = get_output_dir(SOURCE_ROOT, target_arch, component)
+  target_dir = component
+
+  if component == 'native_mksnapshot':
+    ninja.copy(os.path.join(output_dir, 'mksnapshot'), target_dir)
+    ninja.copy(os.path.join(output_dir, 'v8_context_snapshot_generator'), target_dir)
+    copy_dir('gen', relative_to=output_dir, destination=target_dir, ninja=ninja)
+    return
+
+  binaries = BINARIES['all'] + BINARIES[TARGET_PLATFORM]
+
+  if component == 'shared_library':
+    binaries += BINARIES_SHARED_LIBRARY[TARGET_PLATFORM]
+  for binary in binaries:
+    copy_with_blacklist(target_arch, os.path.join(output_dir, binary), target_dir, ninja)
+  for binary in get_snapshot_binaries(target_arch):
+    ninja.copy(os.path.join(output_dir, binary), os.path.join(target_dir, 'snapshot_gen'))
+
+  # Copy all static libraries from chromiumcontent
+  for library in glob.glob(os.path.join(output_dir, 'obj', 'libchromiumcontent', 'chromiumcontent', '*.' + STATIC_LIBRARY_SUFFIX)):
+    ninja.copy(library, target_dir)
+
+  if TARGET_PLATFORM == 'darwin':
+    if component == 'shared_library':
+      for library in glob.glob(os.path.join(output_dir, '*.dylib')):
+        copy_with_blacklist(target_arch, library, target_dir, ninja)
+
+  if TARGET_PLATFORM == 'win32':
+    if component == 'shared_library':
+      # out/Release/*.dll(.lib)
+      debug_dir = os.path.join(os.path.dirname(target_dir), '.debug')
+      for dll in glob.glob(os.path.join(output_dir, '*.dll')):
+        lib = dll + '.lib'
+        if os.path.exists(lib):
+          copy_with_blacklist(target_arch, dll, target_dir, ninja)
+          copy_with_blacklist(target_arch, lib, target_dir, ninja)
+          copy_with_blacklist(target_arch, dll + '.pdb', debug_dir, ninja)
+    elif component == 'static_library':
+      # out/Release/*.pdb
+      for root, _, filenames in os.walk(output_dir):
+        for pdb in filenames:
+          if pdb.endswith('.pdb'):
+            ninja.copy(os.path.join(root, pdb), target_dir)
+
+  if TARGET_PLATFORM == 'linux':
+    if component == 'shared_library':
+      # libname.so
+      libraries = glob.glob(os.path.join(output_dir, '*.so'))
+
+      # libname.so.123
+      regex = re.compile('.*\.so\.[0-9]+$')
+      for dirpath, dirnames, filenames in os.walk(output_dir):
+        for filename in filenames:
+          if regex.match(filename):
+            libraries.append(os.path.join(dirpath, filename))
+
+      for library in libraries:
+        copy_with_blacklist(target_arch, library, target_dir, ninja)
+
+
+def get_snapshot_binaries(target_arch):
+  binaries = []
+  if 'arm' in target_arch:
+   if target_arch == 'arm':
+     binary_prefix = 'clang_x86_v8_arm/'
+   elif target_arch == 'arm64':
+     binary_prefix = 'clang_x64_v8_arm64/'
+   for binary in V8_SNAPSHOT_BINARIES[TARGET_PLATFORM]:
+     binaries.append(binary_prefix + binary)
+  else:
+   binaries += V8_SNAPSHOT_BINARIES[TARGET_PLATFORM]
+  return binaries
+
+def strip_binaries(create_debug_archive, keep_debug_symbols, component,
+                   target_dir, target_arch):
+  if component == 'shared_library':
+    match = '*.{0}'.format(SHARED_LIBRARY_SUFFIX)
+  else:
+    match = '*.{0}'.format(STATIC_LIBRARY_SUFFIX)
+
+  if TARGET_PLATFORM in ['linux', 'darwin'] and not keep_debug_symbols:
+    if create_debug_archive:
+      print 'Extracting debug symbols...'
+    for binary in BINARIES[TARGET_PLATFORM]:
+      run_strip(target_arch,
+                os.path.join(target_dir, os.path.basename(binary)),
+                create_debug_archive)
+    if component == 'shared_library':
+      for library in glob.glob(os.path.join(target_dir, match)):
+        run_strip(target_arch, library, create_debug_archive)
+      for library in glob.glob(os.path.join(target_dir, 'mksnapshot', match)):
+        if ('arm' in target_arch):
+          run_strip('x86', library, False)
+        else:
+          run_strip(target_arch, library, False)
+      # move .debug files into a separate directory
+      debug_dir = os.path.join(os.path.dirname(target_dir), '.debug')
+      filesystem.mkdir_p(debug_dir)
+      for debug_file in glob.glob(os.path.join(target_dir, '*.debug')):
+        shutil.move(debug_file, debug_dir)
+
+
+def copy_generated_sources(target_arch, component, ninja):
+  output_dir = get_output_dir(SOURCE_ROOT, target_arch, component)
+  target_dir = component
+  for include_path in GENERATED_INCLUDE_DIRS:
+    copy_headers(include_path,
+                 relative_to=os.path.join(output_dir, 'gen'),
+                 destination=os.path.join(target_dir, 'gen'),
+                 ninja=ninja)
+
+def copy_locales(target_arch, component, ninja):
+  output_dir = get_output_dir(SOURCE_ROOT, target_arch, component)
+  target_dir = os.path.join(component, 'locales')
+  src_dir = os.path.join(output_dir, 'gen', 'content', 'app', 'strings')
+  for src_file in glob.glob(os.path.join(src_dir, 'content_strings_*.pak')):
+    filename = os.path.basename(src_file)
+    new_name = re.sub('content_strings_', '', filename)
+    ninja.copy(src_file, os.path.join(target_dir, new_name), False)
+
+def copy_sources(ninja):
+  for include_path in INCLUDE_DIRS:
+    copy_headers(include_path, relative_to=SRC_DIR, destination=DIST_SRC_DIR, ninja=ninja)
+
+  for path in OTHER_HEADERS + OTHER_SOURCES:
+    copy_source_file(os.path.join(SRC_DIR, path), relative_to=SRC_DIR,
+                     destination=DIST_SRC_DIR, ninja=ninja)
+
+  for path in OTHER_DIRS:
+    copy_dir(path, relative_to=SRC_DIR, destination=DIST_SRC_DIR, ninja=ninja)
+
+
+def copy_ffmpeg(target_arch, ninja):
+  output_dir = get_output_dir(SOURCE_ROOT, target_arch, 'ffmpeg')
+  if TARGET_PLATFORM == 'darwin':
+    binary = 'libffmpeg.dylib'
+  elif TARGET_PLATFORM == 'linux':
+    binary = 'libffmpeg.so'
+  elif TARGET_PLATFORM == 'win32':
+    binary = 'ffmpeg.dll'
+
+  target_dir = 'ffmpeg'
+  ninja.copy(os.path.join(output_dir, binary), target_dir)
+
+
+
+def copy_headers(relative_path, relative_to, destination, ninja):
+  abs_path = os.path.join(relative_to, relative_path)
+  for dirpath, dirnames, filenames in os.walk(abs_path):
+    for filename in filenames:
+      if os.path.splitext(filename)[1] != '.h':
+        continue
+      copy_source_file(os.path.join(dirpath, filename), relative_to=relative_to, destination=destination, ninja=ninja)
+
+
+def copy_source_file(absolute_path, relative_to, destination, ninja):
+  relative_path = os.path.relpath(absolute_path, start=relative_to)
+  final_path = os.path.join(destination, relative_path)
+  ninja.copy(absolute_path, final_path, dest_is_dir=False)
+
+
+def copy_dir(relative_path, relative_to, destination, ninja):
+  abs_path = os.path.join(relative_to, relative_path)
+  for dirpath, dirnames, filenames in os.walk(abs_path):
+    for filename in filenames:
+      copy_source_file(os.path.join(dirpath, filename), relative_to=relative_to, destination=destination, ninja=ninja)
+
+
+def add_gdb_index_section(gdb, objcopy, symfile, dirname, env):
+  subprocess.check_call([gdb, '-batch',
+                         '-ex', 'file {0}'.format(symfile),
+                         '-ex', 'save gdb-index .'], cwd=dirname, env=env)
+  index_file = symfile + '.gdb-index'
+  subprocess.check_call([objcopy, '--add-section',
+                         '.gdb_index={0}'.format(index_file),
+                         '--set-section-flags', '.gdb_index=readonly',
+                         symfile, symfile], cwd=dirname, env=env)
+  os.unlink(os.path.join(dirname, index_file))
+
+
+def create_debug_file(gdb, objcopy, binfile, symfile, dirname, env):
+  subprocess.check_call([objcopy, '--only-keep-debug', binfile, symfile],
+                        cwd=dirname, env=env)
+  # add gdb_index section to the debug file, which will improve load speed.
+  add_gdb_index_section(gdb, objcopy, symfile, dirname, env)
+
+
+def link_binary_to_debug_file(objcopy, binfile, symfile, dirname, env):
+  subprocess.check_call([objcopy, '--add-gnu-debuglink={0}'.format(symfile),
+                         binfile], cwd=dirname, env=env)
+
+
+def run_strip(target_arch, filename, create_debug_archive):
+  # Static libraries are not stripped because it would remove
+  # all the symbols in it.
+  if filename.endswith('.a'):
+    return
+
+  if TARGET_PLATFORM == 'linux':
+    strip_flags = []
+  else:
+    strip_flags = ['-x', '-S']
+
+  env = os.environ.copy()
+  if target_arch == 'arm64':
+    binutils_dir = os.path.join(VENDOR_DIR, 'binutils-aarch64')
+    env['LD_LIBRARY_PATH'] = binutils_dir + '/usr/x86_64-linux-gnu/aarch64-linux-gnu/lib'
+    env['PATH'] = os.pathsep.join([binutils_dir + '/usr/bin', env['PATH']])
+  elif target_arch == 'mips64el':
+    set_mips64el_env(env)
+
+  if target_arch == 'arm' and filename.endswith(('.so', 'chromedriver')):
+    strip = 'arm-linux-gnueabihf-strip'
+    objcopy = 'arm-linux-gnueabihf-objcopy'
+    gdb = 'arm-linux-gnueabihf-gdb'
+  elif target_arch == 'arm64' and filename.endswith(('.so', 'chromedriver')):
+    strip = 'aarch64-linux-gnu-strip'
+    objcopy = 'aarch64-linux-gnu--objcopy'
+    gdb = 'aarch64-linux-gnu-gdb'
+  elif target_arch == 'mips64el' and filename.endswith(('.so', 'chromedriver')):
+    strip = 'mips64el-loongson-linux-strip'
+    objcopy = 'mips64el-loongson-linux--objcopy'
+    gdb = 'mips64el-loongson-linux-gdb'
+  else:
+    strip = 'strip'
+    objcopy = 'objcopy'
+    gdb = 'gdb'
+  dirname = os.path.dirname(filename)
+  symfile = '{0}.debug'.format(os.path.basename(filename))
+  create_debug_archive = (create_debug_archive
+                          # don't create debug file for libffmpeg as a
+                          # different version will be bundled.
+                          and not symfile.startswith('libffmpeg'))
+  if create_debug_archive:
+    create_debug_file(gdb, objcopy, filename, symfile, dirname, env)
+  subprocess.check_call([strip] + strip_flags + [filename], env=env)
+  if create_debug_archive:
+    link_binary_to_debug_file(objcopy, filename, symfile, dirname, env)
+
+
+def run_ar_combine(filename, target_dir):
+  target = os.path.join(target_dir, os.path.basename(filename))
+  ar_combine = os.path.join(SOURCE_ROOT, 'tools', 'linux', 'ar-combine.sh')
+  subprocess.check_call([ar_combine, '-o', target, filename])
+
+
+def generate_licenses(ninja):
+  file_template = os.path.join(SOURCE_ROOT, 'resources', 'about_credits.tmpl')
+  entry_template = os.path.join(SOURCE_ROOT, 'resources',
+                                'about_credits_entry.tmpl')
+  target = 'LICENSES.chromium.html'
+  data = dict(target=target, file_template=file_template,
+              entry_template=entry_template)
+  ninja.build(target, 'license', ['${licenses_py}', file_template,
+      entry_template], variables=data)
+
+
+def create_archive(create_debug_archive, component):
+  if component == 'all' or component == 'shared_library':
+    print 'Packing shared_library builds...'
+    p = os.path.join(SOURCE_ROOT, 'libchromiumcontent.tar.bz2')
+    make_archive(MAIN_DIR, ['src', 'ffmpeg', 'shared_library'], ['LICENSES.chromium.html'], p)
+  if create_debug_archive:
+    print 'Packing shared library debug files...'
+    p = os.path.join(SOURCE_ROOT, 'libchromiumcontent-dbg.tar.bz2')
+    make_archive(MAIN_DIR, ['.debug'], [], p)
+  if component == 'all' or component == 'static_library':
+    print 'Packing static_library builds...'
+    p = os.path.join(SOURCE_ROOT, 'libchromiumcontent-static.tar.bz2')
+    make_archive(MAIN_DIR, ['static_library'], [], p)
+  if component == 'native_mksnapshot':
+    print 'Packing native mksnapshot...'
+    p = os.path.join(SOURCE_ROOT, 'native-mksnapshot.tar.bz2')
+    make_archive(MAIN_DIR, ['native_mksnapshot'], ['LICENSES.chromium.html'], p)
+
+
+def make_archive(src, dirs, files, target):
+  filesystem.safe_unlink(target)
+  with util.scoped_cwd(src):
+    tar_file = tarfile.open(target, 'w:bz2')
+    for dirname in dirs:
+      for root, _, filenames in os.walk(dirname):
+        for f in filenames:
+          tar_file.add(os.path.join(root, f))
+    for f in files:
+      tar_file.add(f)
+    tar_file.close();
+
+
+def is_newer(destination, source):
+  return os.path.exists(destination) and \
+    os.path.getmtime(destination) > os.path.getmtime(source)
+
+
+if __name__ == '__main__':
+  sys.exit(main())

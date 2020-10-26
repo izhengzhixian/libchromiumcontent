@@ -1,0 +1,74 @@
+root_extra_deps = [ "//libchromiumcontent/chromiumcontent" ]
+is_electron_build = true
+is_component_build = false
+is_official_build = true
+symbol_level = 2
+enable_nacl = false
+enable_widevine = true
+proprietary_codecs = true
+is_component_ffmpeg = true
+ffmpeg_branding = "Chrome"
+
+# This may be guarded behind is_chrome_branded alongside
+# proprietary_codecs https://webrtc-review.googlesource.com/c/src/+/36321,
+# explicitly override here to build OpenH264 encoder/FFmpeg decoder.
+# The initialization of the decoder depends on whether ffmpeg has
+# been built with H.264 support.
+rtc_use_h264 = true
+
+# CFI is disabled for the time being, as Electron is not a monolithic binary
+# with at least one shared library component (Node) and CFI is tricky in that
+# scenario
+is_cfi = false
+
+# Use the system provided standard library on platforms other than Linux.
+if (target_os != "linux") {
+  use_custom_libcxx = false
+}
+
+# This is required by Node.js
+# See https://github.com/nodejs/node/pull/13242
+v8_promise_internal_field_count = 1
+
+# This is required by Node.js
+# Unconditionally force typed arrays to allocate outside the v8 heap. This
+# is to prevent memory pointers from being moved around that are returned by
+# Buffer::Data()
+v8_typed_array_max_size_in_heap = 0
+
+# Suppress the linking warning for arm64:
+# warning: libfreetype.so.6, needed by ../../build/linux/debian_jessie_arm64-sysroot/usr/lib/aarch64-linux-gnu/libfontconfig.so, may conflict with libfreetype.so.6
+if (target_cpu == "arm64") {
+  fatal_linker_warnings = false
+}
+
+# ERROR at //chrome/installer/linux/BUILD.gn:385:7: Assertion failed.
+# Linux installer not configured for this architecture.
+if (target_cpu == "arm64") {
+  enable_linux_installer = false
+}
+
+# On Windows, we cannot use allocator shim because even though this is
+# a non-component build, we still use the dynamic CRT with which the shim
+# does not work
+if (target_os == "win") {
+  use_allocator_shim = false
+}
+
+# FIXME(alexeykuzmin): We should use clang starting Ch67.
+if (target_os == "win") {
+  is_clang = false
+}
+
+# Configuration for mips64el
+if (target_cpu == "mips64el") {
+  is_clang = false
+  use_allocator = "none"
+  mips_arch_variant = "loongson3"
+  # Use custom sysroot image.
+  use_sysroot = true
+  target_sysroot = "//build/linux/debian_jessie_mips64-sysroot"
+  system_libdir = "lib64"
+}
+
+chrome_pgo_phase = 0

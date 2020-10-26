@@ -1,0 +1,419 @@
+import("//build/config/c++/c++.gni")
+import("//build/config/features.gni")
+import("//v8/gni/split_static_library.gni")
+import("//v8/gni/snapshot_toolchain.gni")
+
+declare_args() {
+  is_electron_build = false
+
+}
+group("targets") {
+  deps = []
+
+  # Build these targets when building libchromiumcontent's
+  # "static_library" or "shared_library"
+  if (is_electron_build) {
+    deps += [
+      ":chrome",
+      "//components/prefs",
+      "//components/cdm/renderer",
+      "//components/cookie_config",
+      "//components/security_state/content",
+      "//components/security_state/core",
+      "//content",
+      "//content:sandbox_helper_win",
+      "//content/public/app",
+      "//net",
+      "//pdf",
+      "//ppapi/cpp",
+      "//ppapi/host",
+      "//ppapi/proxy",
+      "//ppapi/shared_impl",
+      "//third_party/libyuv",
+      "//tools/v8_context_snapshot",
+      "//ui/content_accelerators",
+      "//ui/display",
+      "//ui/display/util",
+      "//ui/latency",
+      "//ui/views",
+      "//ui/views/controls/webview",
+    ]
+
+    if (is_component_build) {
+      deps += [
+        ":fx_agg",
+        ":fx_lcms2",
+        ":fx_libopenjpeg",
+        ":fx_zlib",
+        ":libjpeg",
+        ":libyuv",
+        ":pdfium_skia_shared",
+        ":ppapi_cpp_objects",
+        ":ppapi_internal_module",
+        ":security_state",
+      ]
+
+      if (is_win) {
+        deps += [ ":sandbox_helper_win" ]
+      }
+    }
+  }
+
+  # These produce executables we distribute as part of libchromiumcontent.
+  # Statically linked versions of them are built correctly only when the build
+  # configuration is not tweaked for the purposes of statically linked
+  # Electron.
+  if (!is_electron_build || is_component_build) {
+    deps += [
+      "//v8",
+    ]
+  }
+
+  # We build FFMPEG separately in the default non-component configuration
+  if (!is_electron_build && !is_component_build) {
+    deps += [ "//third_party/ffmpeg" ]
+  }
+}
+
+if (is_electron_build && is_component_build) {
+
+  # Electron needs some APIs which are not exported from shared libraries
+  # produced by a component build. So we put a copy of the needed symbols in
+  # this set of static libraries. Most can just depend on the respective
+  # source_set target.
+
+  static_library("fx_agg") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//third_party/pdfium/third_party:fx_agg" ]
+  }
+
+  static_library("fx_lcms2") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//third_party/pdfium/third_party:fx_lcms2" ]
+  }
+
+  static_library("fx_libopenjpeg") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//third_party/pdfium/third_party:fx_libopenjpeg" ]
+  }
+
+  static_library("fx_zlib") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//third_party/zlib:zlib" ]
+  }
+
+  static_library("libjpeg") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//third_party:jpeg" ]
+  }
+
+  static_library("libyuv") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//third_party/libyuv" ]
+  }
+
+  static_library("pdfium_skia_shared") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//third_party/pdfium/third_party:skia_shared" ]
+  }
+
+  static_library("ppapi_cpp_objects") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//ppapi/cpp:objects" ]
+  }
+
+  static_library("ppapi_internal_module") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//ppapi/cpp/private:internal_module" ]
+  }
+
+  static_library("security_state") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [
+        "//components/security_state/content",
+        "//components/security_state/core",
+      ]
+  }
+
+
+  if (is_win) {
+    static_library("sandbox_helper_win") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      deps = [ "//content:sandbox_helper_win" ]
+    }
+  }
+}
+
+if (is_electron_build && !is_component_build) {
+
+  # This is where we build statically linked libchromiumcontent.
+  # After all dependent targets are built, we use a script to collect
+  # all required object files into an "objects.gni" file and re-run
+  # ninja. Because "objects.gni" is a GN input file, it will cause it
+  # to re-generate the targets and produce the static libraries we want.
+
+  is_second_pass = (getenv("CHROMIUMCONTENT_2ND_PASS") != "")
+
+  # Make sure the .gni file exists, otherwise it cannot be imported
+  if (!is_second_pass) {
+    write_file("$target_out_dir/objects.gni", "")
+  }
+
+  import("$target_out_dir/objects.gni")
+
+  action("chromiumcontent") {
+    outputs = [ "$target_out_dir/build_libs.done" ]
+
+    script = "build_libs.py"
+    args = [ "-o", rebase_path("$target_out_dir/objects.gni"),
+             "-s", rebase_path(outputs[0]),
+             "-t", target_cpu ]
+
+    deps = [ ":targets" ]
+  }
+
+  # Normally we would just put everything in a single library plus V8. But
+  # toolchains have various limitations that we would hit - e.g. MSVC cannot
+  # produce a .lib file bigger than 4 GB, LLVM has a limit on the number of
+  # object files on the command line. So we produce multiple libraries.
+  group("libs") {
+    if (is_second_pass) {
+      deps = [
+        ":libchromiumcontent",
+        ":base",
+        ":cc",
+        ":components",
+        ":ppapi",
+        ":media",
+        ":net",
+        ":services",
+        ":skia",
+        ":angle",
+        ":pdfium",
+        ":blink",
+        ":blinkcore",
+        ":blinkbindings",
+        ":blinkmodules",
+        ":v8",
+      ]
+      if (use_custom_libcxx) {
+        deps += [ ":libc++" ]
+      }
+    }
+  }
+
+  if (is_second_pass) {
+    static_library("libchromiumcontent") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_libchromiumcontent
+    }
+
+    static_library("base") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_base
+    }
+
+    static_library("cc") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_cc
+    }
+
+    static_library("components") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_components
+    }
+
+    static_library("ppapi") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_ppapi
+    }
+
+    static_library("media") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_media
+    }
+
+    static_library("net") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_net
+    }
+
+    static_library("services") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_services
+    }
+
+    static_library("skia") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_skia
+    }
+
+    static_library("angle") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_angle
+    }
+
+    static_library("pdfium") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_pdfium
+    }
+
+    static_library("blink") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_blink
+    }
+
+    static_library("blinkbindings") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_blinkbindings
+    }
+
+    static_library("blinkcore") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_blinkcore
+    }
+
+    static_library("blinkmodules") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_blinkmodules
+    }
+
+    static_library("v8") {
+      complete_static_lib = true
+      configs -= [ "//build/config/compiler:thin_archive" ]
+      sources = obj_v8
+    }
+
+    if (use_custom_libcxx) {
+      static_library("libc++") {
+        complete_static_lib = true
+        configs -= [ "//build/config/compiler:thin_archive" ]
+        sources = []
+        if (defined(obj_libcxx)) {
+          sources += obj_libcxx
+        }
+      }
+    }
+  }
+
+} else {
+
+  group("chromiumcontent") {
+    deps = [ ":targets" ]
+  }
+
+  group("chromiumcontent_tests") {
+    testonly = true
+
+    deps = [
+      "//base:base_unittests",
+      "//content/shell:pak",
+      # "//cc:cc_unittests",
+      # "//cc/blink:cc_blink_unittests",
+      # "//content/test:content_browsertests",
+      # "//content/test:content_unittests",
+      # "//crypto:crypto_unittests",
+      # "//gin:gin_unittests",
+      # "//gpu:gpu_unittests",
+      # "//gpu/ipc/service:gpu_ipc_service_unittests",
+      # "//ipc:ipc_tests",
+      # "//media:media_unittests",
+      # "//media/midi:midi_unittests",
+      # "//media/mojo:media_mojo_unittests",
+      # "//media/capture:capture_unittests",
+      # "//mojo/common:mojo_common_unittests",
+      # "//mojo:mojo_unittests",
+      # "//net:net_unittests",
+      # "//ppapi:ppapi_unittests",
+      # "//printing:printing_unittests",
+      # "//skia:skia_unittests",
+      # "//storage:storage_unittests",
+      # "//sql:sql_unittests",
+      # "//third_party/angle/src/tests:angle_unittests",
+      # "//third_party/leveldatabase:env_chromium_unittests",
+      # "//third_party/blink/public:test_support",
+      # "//third_party/blink/public:all_blink", #TODO: Fix build
+      # "//tools/gn:gn_unittests",
+      # "//ui/base:ui_base_unittests",
+      # "//ui/compositor:compositor_unittests", # these are failing in chromium
+      # "//ui/display:display_unittests",
+      # "//ui/events:events_unittests",
+      # "//ui/gl:gl_unittests",
+      # "//url:url_unittests",
+      # "//url/ipc:url_ipc_unittests",
+      # "//v8/test/unittests:unittests",
+    ]
+
+    # if (is_linux) {
+    #   deps += [
+    #     "//net:disk_cache_memory_test",
+    #     "//sandbox/linux:sandbox_linux_unittests",
+    #   ]
+    #
+    #   if (use_dbus) {
+    #     deps += [
+    #       "//dbus:dbus_unittests",
+    #     ]
+    #   }
+    # }
+  }
+  group("native_mksnapshot") {
+    deps = [
+      "//tools/v8_context_snapshot:v8_context_snapshot_generator"
+    ]
+  }
+
+}
+
+static_library("chrome") {
+  if (is_component_build) {
+    complete_static_lib = true
+    configs -= [ "//build/config/compiler:thin_archive" ]
+  }
+  sources = [
+    "//chrome/browser/net/chrome_mojo_proxy_resolver_factory.cc",
+    "//chrome/browser/net/chrome_mojo_proxy_resolver_factory.h",
+    "//chrome/browser/net/proxy_config_monitor.cc",
+    "//chrome/browser/net/proxy_config_monitor.h",
+    "//chrome/browser/net/proxy_service_factory.cc",
+    "//chrome/browser/net/proxy_service_factory.h",
+    "//chrome/common/chrome_switches.cc",
+    "//chrome/common/chrome_switches.h",
+  ]
+  deps = [
+    "//chrome/common:buildflags",
+    "//components/net_log",
+    "//components/proxy_config",
+    "//components/services/app_service/public/mojom",
+    "//net",
+    "//skia",
+    "//services/strings",
+    "//services/proxy_resolver:lib",
+  ]
+}

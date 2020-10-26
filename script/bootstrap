@@ -1,0 +1,24 @@
+#!/usr/bin/env python
+
+import os
+import shutil
+import subprocess
+import sys
+
+import lib.util as util
+
+
+SOURCE_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+
+
+def main():
+  os.chdir(SOURCE_ROOT)
+  result = (subprocess.call(['git', 'submodule', 'sync']) or
+            subprocess.call(['git', 'submodule', 'update',
+                             '--init', '--recursive']))
+  if result:
+    return result
+
+
+if __name__ == '__main__':
+  sys.exit(main())

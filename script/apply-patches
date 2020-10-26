@@ -1,0 +1,62 @@
+#!/usr/bin/env python
+
+import argparse
+import os
+import subprocess
+import sys
+
+from lib.patches import PatchesConfig
+
+
+SOURCE_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+PATCHES_DIR = os.path.join(SOURCE_ROOT, 'patches')
+PATCHES_COMMON_DIR = os.path.join(PATCHES_DIR, 'common')
+PATCHES_MAS_DIR = os.path.join(PATCHES_DIR, 'mas')
+PATCHES_MIPS64EL_DIR = os.path.join(PATCHES_DIR, 'mips64el')
+SRC = 'src'
+SRC_DIR = os.path.join(SOURCE_ROOT, SRC)
+
+
+def main():
+  args = parse_args()
+
+  folders = [PATCHES_COMMON_DIR]
+  if os.environ.has_key('MAS_BUILD'):
+    folders.append(PATCHES_MAS_DIR)
+  if args.target_arch == 'mips64el':
+    folders.append(PATCHES_MIPS64EL_DIR)
+
+  for folder in folders:
+    error = apply_patches_for_dir(folder)
+    if error:
+      sys.stderr.write(error + '\n')
+      sys.stderr.flush()
+      return 1
+
+  return 0
+
+
+def apply_patches_for_dir(directory):
+  for root, dirs, files in os.walk(directory):
+    config = PatchesConfig.from_directory(root)
+    patches_list = config.get_patches_list()
+    if patches_list is None:
+      continue
+
+    (success, failed_patches) = patches_list.apply()
+    if not success:
+      patch_path = failed_patches[0].get_file_path()
+      return '{0} failed to apply'.format(os.path.basename(patch_path))
+
+
+def parse_args():
+  parser = argparse.ArgumentParser(description='Apply all required patches.')
+
+  parser.add_argument('-t', '--target_arch',
+                      help='Target architecture')
+
+  return parser.parse_args()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

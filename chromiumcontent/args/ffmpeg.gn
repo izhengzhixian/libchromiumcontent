@@ -1,0 +1,52 @@
+root_extra_deps = [ "//libchromiumcontent/chromiumcontent" ]
+is_component_build = false
+is_debug = false
+enable_nacl = false
+enable_widevine = true
+proprietary_codecs = false
+is_component_ffmpeg = true
+ffmpeg_branding = "Chromium"
+
+# Use the system provided standard library on platforms other than Linux.
+if (target_os != "linux") {
+  use_custom_libcxx = false
+}
+
+# This is required by Node.js
+# See https://github.com/nodejs/node/pull/13242
+v8_promise_internal_field_count = 1
+
+# This is required by Node.js
+# Unconditionally force typed arrays to allocate outside the v8 heap. This
+# is to prevent memory pointers from being moved around that are returned by
+# Buffer::Data()
+v8_typed_array_max_size_in_heap = 0
+
+if (target_cpu == "arm64") {
+  # Suppress the linking warning for arm64:
+  # warning: libfreetype.so.6, needed by ../../build/linux/debian_jessie_arm64-sysroot/usr/lib/aarch64-linux-gnu/libfontconfig.so, may conflict with libfreetype.so.6
+  fatal_linker_warnings = false
+}
+
+# ERROR at //chrome/installer/linux/BUILD.gn:385:7: Assertion failed.
+# Linux installer not configured for this architecture.
+if (target_cpu == "arm64") {
+  enable_linux_installer = false
+}
+
+# FIXME(alexeykuzmin): We should use clang starting Ch67.
+if (target_os == "win") {
+  is_clang = false
+}
+
+# Configuration for mips64el
+if (target_cpu == "mips64el") {
+  is_clang = false
+  use_allocator = "none"
+  mips_arch_variant = "loongson3"
+  # Use custom sysroot image.
+  use_sysroot = true
+  target_sysroot = "//build/linux/debian_jessie_mips64-sysroot"
+  system_libdir = "lib64"
+}
+chrome_pgo_phase = 0
